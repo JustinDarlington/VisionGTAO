@@ -1,0 +1,23 @@
+// Copyright (c) 2026 Darlington Group LLC. Licensed under the MIT License.
+
+#include "/Engine/Private/Common.ush"
+
+float Saturation;
+float Intensity;
+float3 TintColor;
+int2 ViewRectMin;
+Texture2D<float> InputAO;
+Texture2D InputSceneColor;
+
+float4 ColorizePS(in noperspective float4 UVAndScreenPos : TEXCOORD0, in FStereoPSInput StereoInput, float4 SVPosition : SV_Position) : SV_Target0
+{
+	int2 PixelCoord = int2(SVPosition.xy);
+	float4 SceneColor = InputSceneColor.Load(int3(PixelCoord, 0));
+	float AO = saturate(InputAO.Load(int3(PixelCoord - ViewRectMin, 0)));
+	float3 SafeSceneColor = max(SceneColor.rgb, 0.0);
+	float Luminance = dot(SafeSceneColor, float3(0.3, 0.59, 0.11));
+	float3 PenumbraColor = lerp(Luminance.xxx, SafeSceneColor, Saturation) * max(TintColor, 0.0);
+	float PenumbraMask = saturate((1.0 - AO) * Intensity);
+
+	return float4(lerp(SafeSceneColor, PenumbraColor, PenumbraMask), SceneColor.a);
+}

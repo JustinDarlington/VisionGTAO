@@ -1,0 +1,363 @@
+// Copyright (c) 2026 Darlington Group LLC. Licensed under the MIT License.
+// This is my Unreal adaptation of Intel's MIT-licensed XeGTAO shader.
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/DeferredShadingCommon.ush"
+#include "/Engine/Private/SceneTexturesCommon.ush"
+#include "/Engine/Private/Substrate/Substrate.ush"
+
+int2 ViewRectMin;
+int2 ViewRectSize;
+
+static const float GTAOPi = 3.14159265358979323846;
+static const float GTAOHalfPi = 1.57079632679489661923;
+static const float RadiusMultiplier = 1.457;
+static const float FalloffRange = 0.615;
+static const float SampleDistributionPower = 2.0;
+static const float FinalValuePower = 2.2;
+static const float MinimumPixelOffset = 1.3;
+
+float2 GetBufferUV(uint2 PixelCoord)
+{
+	return (float2(PixelCoord) + 0.5) * View.BufferSizeAndInvSize.zw;
+}
+
+float4 CalculateEdges(float CenterDepth, float LeftDepth, float RightDepth, float TopDepth, float BottomDepth)
+{
+	float4 Edges = float4(LeftDepth, RightDepth, TopDepth, BottomDepth) - CenterDepth;
+	float SlopeLR = (Edges.y - Edges.x) * 0.5;
+	float SlopeTB = (Edges.w - Edges.z) * 0.5;
+	float4 SlopeAdjustedEdges = Edges + float4(SlopeLR, -SlopeLR, SlopeTB, -SlopeTB);
+	Edges = min(abs(Edges), abs(SlopeAdjustedEdges));
+	return saturate(1.25 - Edges / max(CenterDepth * 0.011, 0.000001));
+}
+
+float PackEdges(float4 Edges)
+{
+	Edges = round(saturate(Edges) * 2.9);
+	return dot(Edges, float4(64.0 / 255.0, 16.0 / 255.0, 4.0 / 255.0, 1.0 / 255.0));
+}
+
+float4 UnpackEdges(float PackedEdges)
+{
+	uint PackedValue = (uint)(PackedEdges * 255.5);
+	return float4((PackedValue >> 6) & 3, (PackedValue >> 4) & 3, (PackedValue >> 2) & 3, PackedValue & 3) / 3.0;
+}
+
+#if VISION_GTAO_PREPARE_DEPTH
+RWTexture2D<float> OutputDepthTexture;
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void PrepareDepthCS(uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+	if (any(DispatchThreadID.xy >= uint2(ViewRectSize)))
+	{
+		return;
+	}
+
+	uint2 PixelCoord = DispatchThreadID.xy + uint2(ViewRectMin);
+	float ViewSpaceDepth = CalcSceneDepth(GetBufferUV(PixelCoord));
+	OutputDepthTexture[DispatchThreadID.xy] = ViewSpaceDepth > 0.0 && ViewSpaceDepth < 100000000.0 ? ViewSpaceDepth : 100000000.0;
+}
+#endif
+
+#if VISION_GTAO_MAIN
+float Radius;
+float ThinOccluderCompensation;
+int Quality;
+uint NoiseIndex;
+Texture2D<float> WorkingDepthTexture;
+RWTexture2D<float> OutputTexture;
+RWTexture2D<float> OutputEdges;
+
+float3 GetWorldNormal(uint2 PixelCoord)
+{
+#if SUBSTRATE_GBUFFER_FORMAT == 1
+	FSubstrateAddressing SubstrateAddressing = GetSubstratePixelDataByteOffset(PixelCoord, uint2(View.BufferSizeAndInvSize.xy), Substrate.MaxBytesPerPixel);
+	FSubstratePixelHeader SubstrateHeader = UnpackSubstrateHeaderIn(Substrate.MaterialTextureArray, SubstrateAddressing, Substrate.TopLayerTexture);
+
+	if (SubstrateHeader.SubstrateGetBSDFType() == SUBSTRATE_BSDF_TYPE_HAIR)
+	{
+		return 0.0;
+	}
+
+	return normalize(SubstrateUnpackTopLayerData(Substrate.TopLayerTexture.Load(uint3(PixelCoord, 0))).WorldNormal);
+#else
+	return normalize(DecodeNormal(SceneTexturesStruct.GBufferATexture.Load(int3(PixelCoord, 0)).xyz));
+#endif
+}
+
+uint GetHilbertIndex(uint2 PixelCoord)
+{
+	uint HilbertX = PixelCoord.x & 63u;
+	uint HilbertY = PixelCoord.y & 63u;
+	uint HilbertIndex = 0u;
+
+	[unroll]
+	for (uint HilbertLevel = 32u; HilbertLevel > 0u; HilbertLevel >>= 1u)
+	{
+		uint RegionX = (HilbertX & HilbertLevel) != 0u ? 1u : 0u;
+		uint RegionY = (HilbertY & HilbertLevel) != 0u ? 1u : 0u;
+		HilbertIndex += HilbertLevel * HilbertLevel * ((3u * RegionX) ^ RegionY);
+
+		if (RegionY == 0u)
+		{
+			if (RegionX == 1u)
+			{
+				HilbertX = 63u - HilbertX;
+				HilbertY = 63u - HilbertY;
+			}
+
+			uint HilbertTemp = HilbertX;
+			HilbertX = HilbertY;
+			HilbertY = HilbertTemp;
+		}
+	}
+
+	return HilbertIndex;
+}
+
+float3 ComputeViewPosition(float2 ViewportUV, float ViewSpaceDepth)
+{
+	float2 BufferUV = (ViewportUV * float2(ViewRectSize) + float2(ViewRectMin)) * View.BufferSizeAndInvSize.zw;
+	float2 ScreenSlope = BufferUV * View.ScreenToViewSpace.xy + View.ScreenToViewSpace.zw;
+	return float3(ScreenSlope * ViewSpaceDepth, ViewSpaceDepth);
+}
+
+float LoadDepth(int2 PixelCoord)
+{
+	return WorkingDepthTexture.Load(int3(clamp(PixelCoord, 0, ViewRectSize - 1), 0));
+}
+
+// The GTAO math below comes from Intel's XeGTAO: https://github.com/GameTechDev/XeGTAO
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void MainCS(uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+	if (any(DispatchThreadID.xy >= uint2(ViewRectSize)))
+	{
+		return;
+	}
+
+	uint2 LocalPixelCoord = DispatchThreadID.xy;
+	uint2 PixelCoord      = LocalPixelCoord + uint2(ViewRectMin);
+	float ViewSpaceDepth  = LoadDepth(int2(LocalPixelCoord));
+	float LeftDepth       = LoadDepth(int2(LocalPixelCoord) + int2(-1, 0));
+	float RightDepth      = LoadDepth(int2(LocalPixelCoord) + int2(1, 0));
+	float TopDepth        = LoadDepth(int2(LocalPixelCoord) + int2(0, -1));
+	float BottomDepth     = LoadDepth(int2(LocalPixelCoord) + int2(0, 1));
+	OutputEdges[LocalPixelCoord] = PackEdges(CalculateEdges(ViewSpaceDepth, LeftDepth, RightDepth, TopDepth, BottomDepth));
+
+	if (ViewSpaceDepth <= 0.0 || ViewSpaceDepth >= 100000000.0 || Radius <= 0.0)
+	{
+		OutputTexture[LocalPixelCoord] = 1.0;
+		return;
+	}
+
+	float2 ViewportUV = (float2(LocalPixelCoord) + 0.5) / float2(ViewRectSize);
+	float  BiasedViewSpaceDepth = ViewSpaceDepth * 0.99999;
+	float3 CenterPosition       = ComputeViewPosition(ViewportUV, BiasedViewSpaceDepth);
+	float3 ViewVector           = normalize(-CenterPosition);
+	float3 WorldNormal          = GetWorldNormal(PixelCoord);
+	float3 ViewSpaceNormal      = mul(float4(WorldNormal, 0.0), View.TranslatedWorldToView).xyz;
+	float  NormalLengthSquared  = dot(ViewSpaceNormal, ViewSpaceNormal);
+
+	if (NormalLengthSquared < 0.000001)
+	{
+		OutputTexture[LocalPixelCoord] = 1.0;
+		return;
+	}
+
+	ViewSpaceNormal *= rsqrt(NormalLengthSquared);
+	float  EffectRadius          = max(Radius * RadiusMultiplier, 0.001);
+	float  EffectFalloffDistance = FalloffRange * EffectRadius;
+	float  FalloffFrom           = EffectRadius * (1.0 - FalloffRange);
+	float  FalloffMul            = -1.0 / EffectFalloffDistance;
+	float  FalloffAdd            = FalloffFrom / EffectFalloffDistance + 1.0;
+	int    SliceCount            = Quality == 0 ? 1 : Quality == 1 ? 2 : Quality == 2 ? 3 : 9;
+	int    StepsPerSlice         = Quality <= 1 ? 2 : 3;
+	uint   HilbertIndex          = GetHilbertIndex(PixelCoord) + 288u * (NoiseIndex % 64u);
+	float2 Noise                 = frac(0.5 + (float)HilbertIndex * float2(0.75487766624669276005, 0.56984029099805326591));
+	float2 InvViewSize           = rcp(max(float2(ViewRectSize), 1.0));
+	float  PixelViewSpaceSizeX   = abs(BiasedViewSpaceDepth * View.ScreenToViewSpace.x * View.BufferSizeAndInvSize.z);
+	float  ScreenSpaceRadius     = EffectRadius / max(PixelViewSpaceSizeX, 0.000001);
+	float  Visibility            = saturate((10.0 - ScreenSpaceRadius) / 100.0) * 0.5;
+	float  MinimumSampleScale    = MinimumPixelOffset / max(ScreenSpaceRadius, 0.000001);
+
+	[loop]
+	for (int Slice = 0; Slice < SliceCount; ++Slice)
+	{
+		float  SliceValue                = (float)Slice;
+		float  SliceAngle                = ((SliceValue + Noise.x) / (float)SliceCount) * GTAOPi;
+		float  SliceCosine               = cos(SliceAngle);
+		float  SliceSine                 = sin(SliceAngle);
+		float2 SampleDirection           = float2(SliceCosine, -SliceSine) * ScreenSpaceRadius;
+		float3 DirectionVector           = float3(SliceCosine, SliceSine, 0.0);
+		float3 OrthogonalDirectionVector = DirectionVector - dot(DirectionVector, ViewVector) * ViewVector;
+		float3 AxisVector                = cross(OrthogonalDirectionVector, ViewVector);
+		float  AxisLengthSquared         = dot(AxisVector, AxisVector);
+
+		if (AxisLengthSquared < 0.000001)
+		{
+			continue;
+		}
+
+		AxisVector *= rsqrt(AxisLengthSquared);
+		float3 ProjectedNormalVector = ViewSpaceNormal - AxisVector * dot(ViewSpaceNormal, AxisVector);
+		float NormalSign = sign(dot(OrthogonalDirectionVector, ProjectedNormalVector));
+		float ProjectedNormalLength = length(ProjectedNormalVector);
+		float NormalCosine          = saturate(dot(ProjectedNormalVector, ViewVector) / max(ProjectedNormalLength, 0.000001));
+		float NormalAngle           = NormalSign * acos(clamp(NormalCosine, -1.0, 1.0));
+		float LowHorizonCosine0     = cos(NormalAngle + GTAOHalfPi);
+		float LowHorizonCosine1     = cos(NormalAngle - GTAOHalfPi);
+		float HorizonCosine0        = LowHorizonCosine0;
+		float HorizonCosine1        = LowHorizonCosine1;
+
+		[loop]
+		for (int Step = 0; Step < StepsPerSlice; ++Step)
+		{
+			float StepValue = (float)Step;
+			float StepNoise = frac(Noise.y + (SliceValue + StepValue * (float)StepsPerSlice) * 0.6180339887498948482);
+			float SampleScale = pow((StepValue + StepNoise) / (float)StepsPerSlice, SampleDistributionPower) + MinimumSampleScale;
+			float2 PixelOffset = round(SampleScale * SampleDirection);
+			float2 SampleViewportUV0 = (float2(LocalPixelCoord) + 0.5 + PixelOffset) * InvViewSize;
+			float2 SampleViewportUV1 = (float2(LocalPixelCoord) + 0.5 - PixelOffset) * InvViewSize;
+			float SampleDepth0 = LoadDepth(int2(float2(LocalPixelCoord) + PixelOffset));
+			float SampleDepth1 = LoadDepth(int2(float2(LocalPixelCoord) - PixelOffset));
+			float3 SamplePosition0 = ComputeViewPosition(SampleViewportUV0, SampleDepth0);
+			float3 SamplePosition1 = ComputeViewPosition(SampleViewportUV1, SampleDepth1);
+			float3 SampleDelta0 = SamplePosition0 - CenterPosition;
+			float3 SampleDelta1 = SamplePosition1 - CenterPosition;
+			float SampleDistance0 = length(SampleDelta0);
+			float SampleDistance1 = length(SampleDelta1);
+			float3 SampleHorizonVector0 = SampleDelta0 / max(SampleDistance0, 0.000001);
+			float3 SampleHorizonVector1 = SampleDelta1 / max(SampleDistance1, 0.000001);
+			float ForegroundDepth0 = min(SampleDelta0.z + PixelViewSpaceSizeX * 2.0, 0.0);
+			float ForegroundDepth1 = min(SampleDelta1.z + PixelViewSpaceSizeX * 2.0, 0.0);
+			float CompensatedDepth0 = SampleDelta0.z + ForegroundDepth0 * ThinOccluderCompensation;
+			float CompensatedDepth1 = SampleDelta1.z + ForegroundDepth1 * ThinOccluderCompensation;
+			float SampleFalloffDistance0 = length(float3(SampleDelta0.xy, CompensatedDepth0));
+			float SampleFalloffDistance1 = length(float3(SampleDelta1.xy, CompensatedDepth1));
+			float Weight0 = saturate(SampleFalloffDistance0 * FalloffMul + FalloffAdd);
+			float Weight1 = saturate(SampleFalloffDistance1 * FalloffMul + FalloffAdd);
+			bool ValidSample0 = all(SampleViewportUV0 >= 0.0) && all(SampleViewportUV0 <= 1.0) && SampleDepth0 > 0.0 && SampleDepth0 < 100000000.0;
+			bool ValidSample1 = all(SampleViewportUV1 >= 0.0) && all(SampleViewportUV1 <= 1.0) && SampleDepth1 > 0.0 && SampleDepth1 < 100000000.0;
+			Weight0 *= ValidSample0 ? 1.0 : 0.0;
+			Weight1 *= ValidSample1 ? 1.0 : 0.0;
+			float SampleHorizonCosine0 = lerp(LowHorizonCosine0, dot(SampleHorizonVector0, ViewVector), Weight0);
+			float SampleHorizonCosine1 = lerp(LowHorizonCosine1, dot(SampleHorizonVector1, ViewVector), Weight1);
+			HorizonCosine0 = max(HorizonCosine0, SampleHorizonCosine0);
+			HorizonCosine1 = max(HorizonCosine1, SampleHorizonCosine1);
+		}
+
+		ProjectedNormalLength = lerp(ProjectedNormalLength, 1.0, 0.05);
+		float HorizonAngle0 = -acos(clamp(HorizonCosine1, -1.0, 1.0));
+		float HorizonAngle1 = acos(clamp(HorizonCosine0, -1.0, 1.0));
+		float ArcIntegral0 = (NormalCosine + 2.0 * HorizonAngle0 * sin(NormalAngle) - cos(2.0 * HorizonAngle0 - NormalAngle)) * 0.25;
+		float ArcIntegral1 = (NormalCosine + 2.0 * HorizonAngle1 * sin(NormalAngle) - cos(2.0 * HorizonAngle1 - NormalAngle)) * 0.25;
+		Visibility += ProjectedNormalLength * (ArcIntegral0 + ArcIntegral1);
+	}
+
+	Visibility = pow(saturate(Visibility / (float)SliceCount), FinalValuePower);
+	OutputTexture[LocalPixelCoord] = max(0.03, Visibility);
+}
+#endif
+
+#if VISION_GTAO_DENOISE
+float DenoiseBlurBeta;
+Texture2D<float> InputTexture;
+Texture2D<float> InputEdges;
+RWTexture2D<float> OutputTexture;
+
+float LoadAO(int2 PixelCoord)
+{
+	return InputTexture.Load(int3(clamp(PixelCoord, 0, ViewRectSize - 1), 0));
+}
+
+float4 LoadEdges(int2 PixelCoord)
+{
+	return UnpackEdges(InputEdges.Load(int3(clamp(PixelCoord, 0, ViewRectSize - 1), 0)));
+}
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void DenoiseCS(uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+	if (any(DispatchThreadID.xy >= uint2(ViewRectSize)))
+	{
+		return;
+	}
+
+	int2 PixelCoord = int2(DispatchThreadID.xy);
+
+	float4 CenterEdges = LoadEdges(PixelCoord);
+
+	float4 LeftEdges   = LoadEdges(PixelCoord + int2(-1, 0));
+	float4 RightEdges  = LoadEdges(PixelCoord + int2(1, 0));
+	float4 TopEdges    = LoadEdges(PixelCoord + int2(0, -1));
+	float4 BottomEdges = LoadEdges(PixelCoord + int2(0, 1));
+
+	CenterEdges *= float4(LeftEdges.y, RightEdges.x, TopEdges.w, BottomEdges.z);
+
+	float EdgeLeak       = saturate(1.5 - dot(CenterEdges, 1.0.xxxx)) / 1.5 * 0.5;
+	CenterEdges          = saturate(CenterEdges + EdgeLeak);
+	float DiagonalWeight = 0.85 * 0.5;
+	float WeightTL       = DiagonalWeight * (CenterEdges.x * LeftEdges.z + CenterEdges.z * TopEdges.x);
+	float WeightTR       = DiagonalWeight * (CenterEdges.z * TopEdges.y + CenterEdges.y * RightEdges.z);
+	float WeightBL       = DiagonalWeight * (CenterEdges.w * BottomEdges.x + CenterEdges.x * LeftEdges.w);
+	float WeightBR       = DiagonalWeight * (CenterEdges.y * RightEdges.w + CenterEdges.w * BottomEdges.y);
+	float WeightedAO     = LoadAO(PixelCoord) * DenoiseBlurBeta;
+	float TotalWeight    = DenoiseBlurBeta;
+	WeightedAO += LoadAO(PixelCoord + int2(-1, 0)) * CenterEdges.x;
+	WeightedAO += LoadAO(PixelCoord + int2(1, 0)) * CenterEdges.y;
+	WeightedAO += LoadAO(PixelCoord + int2(0, -1)) * CenterEdges.z;
+	WeightedAO += LoadAO(PixelCoord + int2(0, 1)) * CenterEdges.w;
+	WeightedAO += LoadAO(PixelCoord + int2(-1, -1)) * WeightTL;
+	WeightedAO += LoadAO(PixelCoord + int2(1, -1)) * WeightTR;
+	WeightedAO += LoadAO(PixelCoord + int2(-1, 1)) * WeightBL;
+	WeightedAO += LoadAO(PixelCoord + int2(1, 1)) * WeightBR;
+	TotalWeight += dot(CenterEdges, 1.0.xxxx) + WeightTL + WeightTR + WeightBL + WeightBR;
+	OutputTexture[PixelCoord] = WeightedAO / max(TotalWeight, 0.000001);
+}
+#endif // VISION_GTAO_DENOISE
+
+#if VISION_GTAO_RESOLVE
+float Intensity;
+float Contrast;
+float MinimumVisibility;
+float FadeOutDistance;
+float FadeOutRadius;
+float LuminanceInfluence;
+Texture2D<float> WorkingDepthTexture;
+Texture2D<float> InputTexture;
+Texture2D SceneColorTexture;
+RWTexture2D<float> OutputTexture;
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void ResolveCS(uint3 DispatchThreadID : SV_DispatchThreadID)
+{
+	if (any(DispatchThreadID.xy >= uint2(ViewRectSize)))
+	{
+		return;
+	}
+
+	float ViewSpaceDepth = WorkingDepthTexture.Load(int3(DispatchThreadID.xy, 0));
+	float Visibility = saturate(InputTexture.Load(int3(DispatchThreadID.xy, 0)));
+
+	if (ViewSpaceDepth <= 0.0 || ViewSpaceDepth >= FadeOutDistance || ViewSpaceDepth >= 100000000.0)
+	{
+		OutputTexture[DispatchThreadID.xy] = 1.0;
+		return;
+	}
+
+	float  DistanceFade         = saturate((ViewSpaceDepth - (FadeOutDistance - FadeOutRadius)) / max(FadeOutRadius, 1.0));
+	int2   PixelCoord           = int2(DispatchThreadID.xy) + ViewRectMin;
+	float3 SceneColor           = max(SceneColorTexture.Load(int3(PixelCoord, 0)).rgb, 0.0);
+	float  SceneLuminance       = dot(SceneColor, float3(0.2126, 0.7152, 0.0722));
+	float  DarkAreaMask         = 1.0 - smoothstep(0.0, 0.18, SceneLuminance);
+	float  LuminanceAOIntensity = lerp(1.0, 0.25, DarkAreaMask * saturate(LuminanceInfluence));
+
+	Visibility = lerp(Visibility, 1.0, DistanceFade);
+	Visibility = pow(max(Visibility, 0.000001), Contrast);
+
+	OutputTexture[DispatchThreadID.xy] = max(MinimumVisibility, saturate(1.0 - (1.0 - Visibility) * Intensity * LuminanceAOIntensity));
+}
+#endif // VISION_GTAO_RESOLVE

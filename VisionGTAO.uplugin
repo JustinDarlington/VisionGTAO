@@ -1,0 +1,21 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1.0-alpha",
+	"FriendlyName": "Vision GTAO",
+	"Description": "XeGTAO for Unreal Engine with stock and engine-hook renderer integration modes.",
+	"Category": "Rendering",
+	"CreatedBy": "Darlington Group LLC",
+	"CreatedByURL": "https://store.steampowered.com/app/2921590/Microwave_Simulator/",
+	"EngineVersion": "5.8.0",
+	"CanContainContent": true,
+	"IsExperimentalVersion": true,
+	"EnabledByDefault": true,
+	"Modules": [
+		{
+			"Name": "VisionGTAO",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit"
+		}
+	]
+}

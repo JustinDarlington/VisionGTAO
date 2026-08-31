@@ -1,0 +1,15 @@
+// Copyright (c) 2026 Darlington Group LLC. Licensed under the MIT License.
+
+#include "/Engine/Private/Common.ush"
+
+int2 ViewRectMin;
+Texture2D<float> InputTexture;
+Texture2D InputSceneColor;
+
+float4 CompositePS(in noperspective float4 UVAndScreenPos : TEXCOORD0, in FStereoPSInput StereoInput, float4 SVPosition : SV_Position) : SV_Target0
+{
+	int2 PixelCoord = int2(SVPosition.xy);
+	float4 SceneColor = InputSceneColor.Load(int3(PixelCoord, 0));
+	float Visibility = saturate(InputTexture.Load(int3(PixelCoord - ViewRectMin, 0)));
+	return float4(SceneColor.rgb * Visibility, SceneColor.a);
+}
