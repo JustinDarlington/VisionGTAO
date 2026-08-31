@@ -446,7 +446,7 @@ void FVisionGTAOViewExtension::Render_RenderThread(FRDGBuilder& GraphBuilder, co
 	const FIntPoint SceneDepthExtent = ViewSceneTextures->Depth.Target->Desc.Extent;
 	const FIntPoint NormalExtent = bUseSubstrate ? SceneColorExtent : ViewSceneTextures->GBufferA->Desc.Extent;
 
-	if (View.ViewRect.Min.X < 0 || View.ViewRect.Min.Y < 0 || View.ViewRect.Max.X > SceneColorExtent.X || View.ViewRect.Max.Y > SceneColorExtent.Y 
+	if (View.ViewRect.Min.X < 0 || View.ViewRect.Min.Y < 0 || View.ViewRect.Max.X > SceneColorExtent.X || View.ViewRect.Max.Y > SceneColorExtent.Y
 		|| View.ViewRect.Max.X > SceneDepthExtent.X || View.ViewRect.Max.Y > SceneDepthExtent.Y || View.ViewRect.Max.X > NormalExtent.X || View.ViewRect.Max.Y > NormalExtent.Y)
 	{
 		return;

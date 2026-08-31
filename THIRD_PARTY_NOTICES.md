@@ -11,4 +11,3 @@ XeGTAO is licensed under the MIT License. The original license and source reposi
 ## Unreal Engine
 
 Unreal Engine is a trademark or registered trademark of Epic Games, Inc. Vision GTAO is an independent project and is not endorsed by Epic Games. Use of Unreal Engine is governed by Epic Games' applicable license terms.
-

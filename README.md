@@ -105,4 +105,3 @@ This alpha has been used on Windows with D3D12 and SM6. Other platforms and RHIs
 Vision GTAO is licensed under the [MIT License](LICENSE). The GTAO work is adapted from Intel's MIT-licensed [XeGTAO](https://github.com/GameTechDev/XeGTAO). See [third-party notices](THIRD_PARTY_NOTICES.md).
 
 If this plugin helps you out, wishlist [Microwave Simulator](https://store.steampowered.com/app/2921590/Microwave_Simulator/) on Steam.
-
