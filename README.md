@@ -1,3 +1,5 @@
+# If this plugin helps you out, wishlist [Microwave Simulator](https://store.steampowered.com/app/2921590/Microwave_Simulator/) on Steam.
+
 # Vision GTAO
 
 Vision GTAO is my Unreal Engine 5.8 adaptation of Intel's XeGTAO. I made it because I wanted the fine contact AO from my old Post Process Volume version without being stuck with a late PPV blendable.
@@ -103,5 +105,3 @@ This alpha has been used on Windows with D3D12 and SM6. Other platforms and RHIs
 ## Credits
 
 Vision GTAO is licensed under the [MIT License](LICENSE). The GTAO work is adapted from Intel's MIT-licensed [XeGTAO](https://github.com/GameTechDev/XeGTAO). See [third-party notices](THIRD_PARTY_NOTICES.md).
-
-If this plugin helps you out, wishlist [Microwave Simulator](https://store.steampowered.com/app/2921590/Microwave_Simulator/) on Steam.
